@@ -144,60 +144,110 @@ def digitize_uploaded_ecg(pil_image: Image.Image,
                             n_leads: int = 7,
                             seq_len: int = SEQ_LEN) -> np.ndarray:
     """
-    Digitize an uploaded ECG image into n_leads × seq_len signal array.
+    Digitize a real clinical 12-lead ECG image into n_leads × seq_len signals.
 
-    The image is assumed to follow standard 12-lead layout: 6 rows × 2 columns.
-    Each subplot is cropped (with margin) and scanned column-by-column to
-    extract the signal from black pixel centroids.
+    Standard clinical ECG layout (6 rows × 2 columns):
+        Left column  (col 0): I, II, III, aVR, aVL, aVF   (rows 0-5)
+        Right column (col 1): V1, V2,  V3,  V4,  V5,  V6  (rows 0-5)
+
+    The 7 input leads map to grid positions:
+        I=>(0,0)  II=>(1,0)  III=>(2,0)  aVR=>(3,0)  aVL=>(4,0)  aVF=>(5,0)  V1=>(0,1)
+
+    Handles:
+        - Header text region at top of image
+        - Calibration pulse at the start of each lead strip
+        - Lead label text on the left of each strip
+        - Red grid lines (isolated via RGB channel separation)
 
     Returns float32 array [n_leads, seq_len].
     """
-    img  = np.array(pil_image.convert('RGB'))
+    # ── Resize to standard working resolution ────────────────────────
+    pil_image = pil_image.convert('RGB')
+    W_work, H_work = 1400, 1050
+    pil_image = pil_image.resize((W_work, H_work), Image.LANCZOS)
+
+    img  = np.array(pil_image)
     H, W = img.shape[:2]
-    R, G, B = img[:,:,0], img[:,:,1], img[:,:,2]
+    R, G, B = img[:,:,0].astype(np.float32), \
+               img[:,:,1].astype(np.float32), \
+               img[:,:,2].astype(np.float32)
 
-    # Black = signal, red = grid, white = background
-    sig_mask = (R < 100) & (G < 100) & (B < 100)
+    # ── Isolate signal pixels (black) from red grid and white background ──
+    # Black signal: all channels low
+    # Red grid:     R high, G+B low
+    # White bg:     all channels high
+    sig_mask = (R < 80) & (G < 80) & (B < 80)
 
-    rows_grid, cols_grid = 6, 2
-    row_h = H / rows_grid
-    col_w = W / cols_grid
+    # ── Grid geometry ─────────────────────────────────────────────────
+    # Real ECGs have a header (~12% of height) and footer (~5%)
+    header_frac = 0.12
+    footer_frac = 0.05
+    body_top  = int(H * header_frac)
+    body_bot  = int(H * (1.0 - footer_frac))
+    body_H    = body_bot - body_top
+
+    n_rows, n_cols = 6, 2
+    row_h = body_H / n_rows
+    col_w = W      / n_cols
+
+    # ── Explicit (row, col) position for each of the 7 input leads ───
+    # Clinical layout: left col = limb leads top-to-bottom,
+    #                  right col = precordial leads top-to-bottom
+    lead_grid_pos = [
+        (0, 0),   # I
+        (1, 0),   # II
+        (2, 0),   # III
+        (3, 0),   # aVR
+        (4, 0),   # aVL
+        (5, 0),   # aVF
+        (0, 1),   # V1
+    ]
 
     signals = []
-    for lead_idx in range(n_leads):
-        row, col = divmod(lead_idx, cols_grid)
+    for lead_idx in range(min(n_leads, len(lead_grid_pos))):
+        grow, gcol = lead_grid_pos[lead_idx]
 
-        # Crop with inset margins to skip axes borders and tick labels
-        r0 = int(row       * row_h + row_h * 0.15)
-        r1 = int((row + 1) * row_h - row_h * 0.08)
-        c0 = int(col       * col_w + col_w * 0.06)
-        c1 = int((col + 1) * col_w - col_w * 0.03)
+        # Row boundaries (within body, with vertical inset)
+        r0 = body_top + int(grow       * row_h + row_h * 0.18)
+        r1 = body_top + int((grow + 1) * row_h - row_h * 0.10)
+
+        # Column boundaries — skip:
+        #   left inset  (10%): calibration pulse + lead label text
+        #   right inset (2%):  right border
+        c0 = int(gcol       * col_w + col_w * 0.10)
+        c1 = int((gcol + 1) * col_w - col_w * 0.02)
 
         region  = sig_mask[r0:r1, c0:c1]
         rH, rW  = region.shape
-        sig_out = np.zeros(rW, dtype=np.float32)
 
+        if rH <= 0 or rW <= 0:
+            signals.append(np.zeros(seq_len, dtype=np.float32))
+            continue
+
+        sig_out = np.full(rW, np.nan, dtype=np.float32)
         for xc in range(rW):
             dark_rows = np.where(region[:, xc])[0]
             if len(dark_rows) > 0:
-                sig_out[xc] = 1.0 - (dark_rows.mean() / rH)
-            else:
-                sig_out[xc] = np.nan
+                # Use median instead of mean — more robust to text/border pixels
+                sig_out[xc] = 1.0 - (np.median(dark_rows) / rH)
 
-        # Interpolate gaps
+        # Interpolate NaN gaps (columns with no signal pixels)
         nans = np.isnan(sig_out)
-        if nans.any():
+        if nans.all():
+            sig_out = np.zeros(rW, dtype=np.float32)
+        elif nans.any():
             xp = np.where(~nans)[0]
-            if len(xp) > 1:
-                sig_out = np.interp(np.arange(rW), xp, sig_out[~nans])
-            else:
-                sig_out = np.full(rW, 0.5)
+            sig_out = np.interp(np.arange(rW), xp, sig_out[~nans]).astype(np.float32)
 
-        sig = median_filter(sig_out.astype(np.float32), size=5)
+        # Smooth out remaining isolated noise spikes
+        sig = median_filter(sig_out, size=7).astype(np.float32)
+
+        # Resample → target length, bandpass filter, z-score normalise
         sig = resample(sig, seq_len).astype(np.float32)
         sig = bandpass(sig, fs=FS)
         mu  = sig.mean(); std = sig.std()
-        if std > 1e-8: sig = (sig - mu) / std
+        if std > 1e-8:
+            sig = (sig - mu) / std
         signals.append(sig)
 
     return np.stack(signals, axis=0)   # [n_leads, seq_len]
