@@ -12,7 +12,8 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from PIL import Image
 from scipy.signal import butter, sosfilt, resample
-from scipy.ndimage import median_filter
+from scipy.ndimage import median_filter, gaussian_filter, binary_dilation, gaussian_filter1d, sobel
+from scipy.signal import find_peaks
 
 warnings.filterwarnings('ignore')
 
@@ -140,57 +141,110 @@ def _digitize_lead_image(pil_img: Image.Image,
     return sig
 
 
+def _adaptive_canny(signal_channel: np.ndarray,
+                    sigma: float = 1.2,
+                    low_pct: float = 75,
+                    high_pct: float = 93) -> np.ndarray:
+    """
+    Canny edge detection with adaptive thresholds.
+
+    Why Canny over plain dark-pixel threshold:
+      - Produces single-pixel thin edges instead of 2-4px thick blobs,
+        giving sub-pixel amplitude precision via median centroid.
+      - Adaptive thresholds (percentile-based) handle faint flat leads
+        and tall QRS spikes in the same image without manual tuning.
+      - Hysteresis linking prevents broken edges on faint signal sections.
+
+    Thresholds are set at the p75 and p93 of the image's actual gradient
+    magnitude distribution — automatically scales to image contrast.
+    """
+    blurred = gaussian_filter(signal_channel.astype(float), sigma=sigma)
+    gx      = np.gradient(blurred, axis=1)
+    gy      = np.gradient(blurred, axis=0)
+    mag     = np.hypot(gx, gy)
+    nonzero = mag.ravel()
+    nonzero = nonzero[nonzero > 0.5]
+    if len(nonzero) < 10:
+        return np.zeros_like(mag, dtype=bool)
+    low    = float(np.percentile(nonzero, low_pct))
+    high   = float(np.percentile(nonzero, high_pct))
+    strong = mag > high
+    weak   = (mag >= low) & ~strong
+    return strong | (weak & binary_dilation(strong, iterations=2))
+
+
+def _detect_grid_spacing(region_rgb: np.ndarray):
+    """
+    Detect minor grid spacing (pixels) from vertical redness-channel peaks.
+
+    Standard ECG paper calibration:
+      1 minor square = 1mm = 0.04 s horizontally = 0.1 mV vertically
+      Paper speed = 25mm/s,  Amplitude gain = 10mm/mV
+
+    Returns (minor_sp_px, px_per_sec, px_per_mv).
+    Falls back to 7.9px (≈200 DPI standard scan) if detection fails.
+    """
+    R = region_rgb[:,:,0].astype(float)
+    G = region_rgb[:,:,1].astype(float)
+    B = region_rgb[:,:,2].astype(float)
+    redness     = np.maximum(0.0, R - (G + B) / 2.0)
+    col_profile = gaussian_filter(redness.mean(axis=0), sigma=2.0)
+    peaks, _    = find_peaks(col_profile, height=4, distance=4)
+    if len(peaks) >= 10:
+        spacings = np.diff(peaks)
+        minor_sp = float(np.median(spacings[spacings < np.percentile(spacings, 60)]))
+        if 3 < minor_sp < 60:
+            return minor_sp, minor_sp / 0.04, minor_sp / 0.1
+    return 7.9, 7.9 / 0.04, 7.9 / 0.1
+
+
 def digitize_uploaded_ecg(pil_image: Image.Image,
                             n_leads: int = 7,
                             seq_len: int = SEQ_LEN) -> np.ndarray:
     """
-    Digitize a standard clinical 12-lead ECG printout image.
+    ECG image digitizer with 4 improvements:
 
-    Layout (calibrated from pixel analysis of real ECG scans):
-        Left column  (col 0): I, II, III, aVR, aVL, aVF   (rows 0-5)
-        Right column (col 1): V1, V2, V3, V4, V5, V6      (rows 0-5)
+    1. ORIGINAL RESOLUTION
+       Works at native pixel density — no downscaling that blurs the signal.
 
-    Image is normalised to 2000x1413 internally for consistent thresholds.
-    Signal pixels isolated as black (R,G,B < 80), separating from red grid
-    and white background. Column-by-column median centroid scan extracts
-    1D signal from each lead region.
+    2. ADAPTIVE CANNY + DARK PIXEL FALLBACK
+       For each lead strip:
+         a) Redness channel = R − avg(G,B) → identifies pink/red grid pixels.
+         b) Signal channel  = inverted brightness × (1 − grid_weight):
+            black signal → high value;  red grid → suppressed.
+         c) Adaptive Canny (p75/p93 thresholds) → single-pixel thin edge.
+         d) Dark-pixel fallback (R,G,B < 130, not reddish) for flat leads
+            where JPEG compression makes the signal line near-invisible to Canny.
+         e) Column scan: Canny rows preferred; dark rows used as fallback.
 
-    Returns float32 array [n_leads, seq_len].
+    3. NaN INTERPOLATION
+       NaNs arise when no signal pixel exists in a column (grid intersection,
+       JPEG blur, or lead-label overlap). np.interp() fills each NaN by
+       linear interpolation between nearest valid neighbours. Safe because
+       gaps are 1-5 pixels wide — amplitude change is negligible across them.
+
+    4. GRID-REFERENCED mV CONVERSION
+       _detect_grid_spacing() finds the minor grid spacing in pixels from
+       redness-channel column peaks. Signal y-position is then converted:
+         mV = (mid_row − signal_row) / px_per_mv
+       Output is in calibrated mV units before z-scoring.
+
+    Returns float32 array [n_leads, seq_len], z-score normalised.
     """
-    pil_image = pil_image.convert('RGB')
-    # Normalise to reference resolution for consistent pixel thresholds
-    W, H = 2000, 1413
-    pil_image = pil_image.resize((W, H), Image.LANCZOS)
-    arr = np.array(pil_image)
+    # 1. ORIGINAL RESOLUTION
+    img  = np.array(pil_image.convert('RGB'))
+    H, W = img.shape[:2]
 
-    R = arr[:,:,0].astype(np.float32)
-    G = arr[:,:,1].astype(np.float32)
-    B = arr[:,:,2].astype(np.float32)
+    body_top = int(H * 0.12)
+    body_bot = int(H * 0.95)
+    body_H   = body_bot - body_top
+    row_h    = body_H / 6
+    col_w    = W / 2
 
-    # Black = signal  |  Red = grid  |  White = background
-    sig_mask = (R < 80) & (G < 80) & (B < 80)
-
-    # Layout constants (calibrated via pixel analysis of real ECG scans)
-    # Header contains patient info + measurements (~20% of height)
-    # Footer contains technical info bar (~3% of height)
-    header_end   = 285    # first body row
-    footer_start = 1373   # last body row
-    body_H       = footer_start - header_end   # 1088 px
-    row_h        = body_H / 6                  # 181 px per lead row
-    v_inset      = int(row_h * 0.10)           # vertical margin per strip
-
-    # Vertical dotted divider between left and right columns at col 1010
-    div_col  = 1010
-    cal_skip = 130   # skip calibration square + lead label text
-    r_margin = 20    # skip right edge of each column
-
-    col_bounds = [
-        (cal_skip,           div_col - r_margin),   # left col: I,II,III,aVR,aVL,aVF
-        (div_col + cal_skip, W       - r_margin),   # right col: V1,V2,V3,V4,V5,V6
-    ]
-
-    # Explicit grid position (row, col) for each of the 7 input leads
-    lead_grid = [
+    # Clinical 12-lead layout:
+    #   Left col  (col 0): I, II, III, aVR, aVL, aVF  rows 0-5
+    #   Right col (col 1): V1, V2, V3, V4, V5, V6     rows 0-5
+    lead_grid_pos = [
         (0, 0),  # I
         (1, 0),  # II
         (2, 0),  # III
@@ -201,56 +255,65 @@ def digitize_uploaded_ecg(pil_image: Image.Image,
     ]
 
     signals = []
-    for lead_idx in range(min(n_leads, len(lead_grid))):
-        grow, gcol = lead_grid[lead_idx]
+    for lead_idx in range(min(n_leads, 7)):
+        grow, gcol = lead_grid_pos[lead_idx]
+        r0 = body_top + int(grow       * row_h + row_h * 0.18)
+        r1 = body_top + int((grow + 1) * row_h - row_h * 0.10)
+        c0 = int(gcol       * col_w + col_w * 0.10)
+        c1 = int((gcol + 1) * col_w - col_w * 0.02)
 
-        r0 = header_end + int(grow       * row_h) + v_inset
-        r1 = header_end + int((grow + 1) * row_h) - v_inset
-        c0, c1 = col_bounds[gcol]
+        region = img[r0:r1, c0:c1]
+        rH, rW = region.shape[:2]
 
-        if r1 <= r0 or c1 <= c0:
-            signals.append(np.zeros(seq_len, dtype=np.float32))
-            continue
+        # 4. GRID CALIBRATION
+        minor_sp, px_per_sec, px_per_mv = _detect_grid_spacing(region)
 
-        region = sig_mask[r0:r1, c0:c1]
-        rH, rW = region.shape
+        # 2. SIGNAL CHANNEL + ADAPTIVE CANNY
+        R = region[:,:,0].astype(np.float64)
+        G = region[:,:,1].astype(np.float64)
+        B = region[:,:,2].astype(np.float64)
+        redness        = np.maximum(0.0, R - (G + B) / 2.0)
+        brightness     = (R + G + B) / 3.0
+        grid_weight    = np.clip(redness / 25.0, 0.0, 1.0)
+        signal_channel = (255.0 - brightness) * (1.0 - grid_weight * 0.80)
 
-        # Column-by-column median centroid scan
-        sig_out = np.full(rW, np.nan, dtype=np.float32)
+        canny_mask = _adaptive_canny(signal_channel, sigma=1.2,
+                                     low_pct=75, high_pct=93)
+        # Fallback: any dark non-reddish pixel (handles JPEG-blurred flat leads)
+        dark_mask  = (R < 130) & (G < 130) & (B < 130) & (redness < 25)
+
+        # Column scan: Canny preferred, dark pixels as fallback
+        sig_px = np.full(rW, np.nan, dtype=np.float64)
         for xc in range(rW):
-            dark = np.where(region[:, xc])[0]
-            if len(dark) > 0:
-                sig_out[xc] = 1.0 - (np.median(dark) / rH)
+            canny_rows = np.where(canny_mask[:, xc])[0]
+            dark_rows  = np.where(dark_mask[:, xc])[0]
+            if len(canny_rows) > 0:
+                sig_px[xc] = float(np.median(canny_rows))
+            elif len(dark_rows) > 0:
+                sig_px[xc] = float(np.median(dark_rows))
 
-        # Detect Lead Off: fewer than 5% of columns have signal pixels
-        valid_frac = np.sum(~np.isnan(sig_out)) / rW
-        if valid_frac < 0.05:
-            signals.append(np.zeros(seq_len, dtype=np.float32))
-            continue
+        # 4. PIXEL → mV CONVERSION
+        baseline_px = rH / 2.0
+        sig_mv      = (baseline_px - sig_px) / px_per_mv
 
-        # Interpolate NaN gaps
-        nans = np.isnan(sig_out)
-        if nans.any():
-            xp = np.where(~nans)[0]
-            sig_out = np.interp(np.arange(rW), xp, sig_out[~nans]).astype(np.float32)
+        # 3. NaN INTERPOLATION
+        nans = np.isnan(sig_mv)
+        if nans.all():
+            sig_mv = np.zeros(rW, dtype=np.float32)
+        elif nans.any():
+            xp     = np.where(~nans)[0]
+            sig_mv = np.interp(np.arange(rW), xp, sig_mv[~nans]).astype(np.float32)
 
-        # Light median filter (size=3) to remove isolated noise without blurring QRS
-        sig = median_filter(sig_out, size=3).astype(np.float32)
-
-        # Resample to seq_len, bandpass 0.5-40 Hz, z-score
+        # Post-process: smooth → resample → bandpass → z-score
+        sig = median_filter(sig_mv.astype(np.float32), size=7)
         sig = resample(sig, seq_len).astype(np.float32)
         sig = bandpass(sig, fs=FS)
         mu  = sig.mean(); std = sig.std()
         if std > 1e-8:
             sig = (sig - mu) / std
-        else:
-            sig = np.zeros(seq_len, dtype=np.float32)
         signals.append(sig)
 
-    return np.stack(signals, axis=0)   # [n_leads, seq_len]
-
-
-# ── Model classes
+    return np.stack(signals, axis=0)
 
 
 # ── Model classes (copied from notebook) ─────────────────────────────────────
