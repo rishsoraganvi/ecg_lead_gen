@@ -13,6 +13,7 @@ import matplotlib.gridspec as gridspec
 from PIL import Image
 from scipy.signal import butter, sosfilt, resample
 from scipy.ndimage import median_filter
+from streamlit_drawable_canvas import st_canvas
 
 warnings.filterwarnings('ignore')
 
@@ -686,63 +687,164 @@ def main():
 
                 # ── Crop mode toggle ──────────────────────────────────────
                 crop_mode = st.toggle(
-                    "✂️ Manual lead crop mode",
+                    "✂️ Manual ROI crop mode",
                     value=st.session_state.get('_crop_mode', False),
-                    help="Adjust per-lead bounding boxes to improve digitization accuracy",
+                    help="Draw a rectangle directly on the ECG image to define each lead's region",
                 )
                 st.session_state['_crop_mode'] = crop_mode
 
                 if crop_mode:
-                    st.info(
-                        "Select a lead below, then drag the sliders to fit the bounding box "
-                        "tightly around the waveform strip. Click **Apply crops** when done."
-                    )
-
                     boxes = st.session_state['_crop_boxes']
 
-                    # Lead selector
-                    active_lead = st.selectbox(
-                        "Lead to adjust", INPUT_LEADS,
-                        key='_active_lead'
+                    # ── Lead sequencer: which lead are we drawing next? ──
+                    lead_idx = st.session_state.get('_roi_lead_idx', 0)
+                    leads_done = st.session_state.get('_roi_leads_done', set())
+
+                    # Progress chips
+                    chip_html = ""
+                    for i, ln in enumerate(INPUT_LEADS):
+                        if ln in leads_done:
+                            chip_html += (
+                                f'<span style="background:#22c55e;color:#fff;'
+                                f'padding:3px 10px;border-radius:999px;margin:2px;'
+                                f'font-size:13px;font-weight:600">✓ {ln}</span>'
+                            )
+                        elif i == lead_idx:
+                            chip_html += (
+                                f'<span style="background:#f97316;color:#fff;'
+                                f'padding:3px 10px;border-radius:999px;margin:2px;'
+                                f'font-size:13px;font-weight:700;'
+                                f'box-shadow:0 0 0 2px #fb923c">● {ln}</span>'
+                            )
+                        else:
+                            chip_html += (
+                                f'<span style="background:#e5e7eb;color:#6b7280;'
+                                f'padding:3px 10px;border-radius:999px;margin:2px;'
+                                f'font-size:13px">○ {ln}</span>'
+                            )
+                    st.markdown(
+                        f'<div style="margin:6px 0 10px">{chip_html}</div>',
+                        unsafe_allow_html=True,
                     )
 
-                    # Overlay preview (updates live as sliders move)
-                    overlay_img = render_crop_overlay(pil_img, boxes, active_lead)
-                    st.image(overlay_img,
-                             caption="Crop boxes — active lead highlighted in orange",
-                             use_container_width=True)
+                    if lead_idx < len(INPUT_LEADS):
+                        active_lead = INPUT_LEADS[lead_idx]
+                        st.markdown(
+                            f"**Draw a box around lead `{active_lead}` on the image below. "
+                            f"Hold and drag to select the waveform strip.**"
+                        )
+                    else:
+                        active_lead = None
+                        st.success("✅ All leads cropped! Click **Apply ROI crops & digitize** below.")
 
-                    # Per-lead slider controls
-                    x0, y0, x1, y1 = boxes[active_lead]
-                    st.markdown(f"**Adjust crop box for lead `{active_lead}`:**")
+                    # ── Canvas: fit image to fixed display width ──────────
+                    CANVAS_W = 900
+                    scale    = CANVAS_W / W_disp
+                    CANVAS_H = int(H_disp * scale)
 
-                    c_left, c_right = st.columns(2)
-                    with c_left:
-                        new_x0 = st.slider("Left  (x0)",  0, W_disp - 2, int(x0), key='sl_x0')
-                        new_y0 = st.slider("Top   (y0)",  0, H_disp - 2, int(y0), key='sl_y0')
-                    with c_right:
-                        new_x1 = st.slider("Right (x1)",  new_x0 + 1, W_disp, int(x1), key='sl_x1')
-                        new_y1 = st.slider("Bottom(y1)",  new_y0 + 1, H_disp, int(y1), key='sl_y1')
+                    # Build background: overlay all confirmed boxes in green,
+                    # current-lead default box in orange
+                    bg_img = render_crop_overlay(
+                        pil_img.resize((CANVAS_W, CANVAS_H), Image.LANCZOS),
+                        {
+                            ln: (
+                                int(boxes[ln][0] * scale),
+                                int(boxes[ln][1] * scale),
+                                int(boxes[ln][2] * scale),
+                                int(boxes[ln][3] * scale),
+                            )
+                            for ln in leads_done
+                        },
+                        active_lead=None,
+                    )
 
-                    # Update box immediately for live preview on next rerun
-                    boxes[active_lead] = (new_x0, new_y0, new_x1, new_y1)
-                    st.session_state['_crop_boxes'] = boxes
+                    # Show canvas only while there are leads left
+                    if active_lead is not None:
+                        canvas_result = st_canvas(
+                            fill_color="rgba(249,115,22,0.15)",
+                            stroke_width=2,
+                            stroke_color="#f97316",
+                            background_image=bg_img,
+                            update_streamlit=True,
+                            width=CANVAS_W,
+                            height=CANVAS_H,
+                            drawing_mode="rect",
+                            key=f"canvas_{active_lead}",
+                        )
 
-                    # Preview the cropped region for active lead
-                    crop_preview = pil_img.crop((new_x0, new_y0, new_x1, new_y1))
-                    st.markdown(f"**Cropped region — `{active_lead}`:**")
-                    st.image(crop_preview, use_container_width=True)
+                        # Read the freshly drawn rectangle
+                        if (canvas_result.json_data is not None and
+                                len(canvas_result.json_data.get("objects", [])) > 0):
+                            obj = canvas_result.json_data["objects"][-1]
+                            if obj.get("type") == "rect" and obj.get("width", 0) > 5:
+                                # Canvas coords → original image coords
+                                cx0 = int(obj["left"]              / scale)
+                                cy0 = int(obj["top"]               / scale)
+                                cx1 = int((obj["left"]+obj["width"])  / scale)
+                                cy1 = int((obj["top"] +obj["height"]) / scale)
 
-                    # Reset + Apply buttons
+                                confirm_col, skip_col = st.columns([2, 1])
+                                with confirm_col:
+                                    if st.button(
+                                        f"✔ Confirm box for **{active_lead}**  "
+                                        f"({cx1-cx0}×{cy1-cy0} px)",
+                                        type="primary",
+                                    ):
+                                        boxes[active_lead] = (cx0, cy0, cx1, cy1)
+                                        st.session_state['_crop_boxes']     = boxes
+                                        leads_done.add(active_lead)
+                                        st.session_state['_roi_leads_done'] = leads_done
+                                        st.session_state['_roi_lead_idx']   = lead_idx + 1
+                                        st.rerun()
+                                with skip_col:
+                                    if st.button("⏭ Skip (keep auto)"):
+                                        leads_done.add(active_lead)
+                                        st.session_state['_roi_leads_done'] = leads_done
+                                        st.session_state['_roi_lead_idx']   = lead_idx + 1
+                                        st.rerun()
+
+                        # Live crop preview below canvas
+                        x0b, y0b, x1b, y1b = boxes[active_lead]
+                        crop_prev = pil_img.crop((x0b, y0b, x1b, y1b))
+                        st.caption(
+                            f"Current region for **{active_lead}** "
+                            f"({x1b-x0b}×{y1b-y0b} px original) — updates after confirm"
+                        )
+                        st.image(crop_prev, use_container_width=True)
+
+                    else:
+                        # All leads done — show summary overlay
+                        summary_img = render_crop_overlay(
+                            pil_img.resize((CANVAS_W, CANVAS_H), Image.LANCZOS),
+                            {
+                                ln: (
+                                    int(boxes[ln][0] * scale),
+                                    int(boxes[ln][1] * scale),
+                                    int(boxes[ln][2] * scale),
+                                    int(boxes[ln][3] * scale),
+                                )
+                                for ln in boxes
+                            },
+                        )
+                        st.image(summary_img, caption="Final ROI layout", use_container_width=True)
+
+                    # ── Action buttons ────────────────────────────────────
+                    st.divider()
                     btn_col1, btn_col2 = st.columns(2)
                     with btn_col1:
-                        if st.button("↩ Reset all crops to auto-detected"):
-                            st.session_state['_crop_boxes'] = default_lead_crops(W_disp, H_disp)
-                            st.session_state['_signals_7']  = None
+                        if st.button("↩ Reset all ROIs to auto-detected"):
+                            st.session_state['_crop_boxes']     = default_lead_crops(W_disp, H_disp)
+                            st.session_state['_roi_lead_idx']   = 0
+                            st.session_state['_roi_leads_done'] = set()
+                            st.session_state['_signals_7']      = None
                             st.rerun()
                     with btn_col2:
-                        if st.button("✅ Apply crops & digitize", type='primary'):
-                            with st.spinner("Digitizing from manual crops…"):
+                        if st.button(
+                            "✅ Apply ROI crops & digitize",
+                            type='primary',
+                            disabled=(len(leads_done) == 0),
+                        ):
+                            with st.spinner("Digitizing from ROI crops…"):
                                 try:
                                     signals_7 = digitize_from_crops(
                                         pil_img,
@@ -751,7 +853,8 @@ def main():
                                     )
                                     st.session_state['_signals_7'] = signals_7
                                     st.success(
-                                        f"✓ Digitized from manual crops: shape {signals_7.shape}, "
+                                        f"✓ Digitized from {len(leads_done)} manual ROI(s): "
+                                        f"shape {signals_7.shape}, "
                                         f"range [{signals_7.min():.2f}, {signals_7.max():.2f}]"
                                     )
                                 except Exception as e:
