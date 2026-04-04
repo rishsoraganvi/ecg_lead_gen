@@ -141,56 +141,119 @@ def _digitize_lead_image(pil_img: Image.Image,
     return sig
 
 
+def _extract_signal_from_region(region_arr: np.ndarray,
+                                 seq_len: int = SEQ_LEN,
+                                 skip_left_frac: float = 0.08) -> np.ndarray:
+    """
+    Shared low-level digitizer used by both auto and manual-crop paths.
+
+    Pixel analysis of real ECG printouts showed three failure modes in the
+    original code:
+      1. Threshold R,G,B < 80 misses the waveform — clinical ECG lines are
+         dark grey (brightness 50–150), not pure black.
+      2. Colored ROI box borders (cyan/purple: high-B, low-R) were detected
+         as signal, producing a flat line at the border row.
+      3. A single global threshold fails across the wide brightness range of
+         different ECG papers and lighting conditions.
+
+    Fix — three-step pipeline:
+      A. Per-column adaptive background: 88th-percentile brightness per column
+         → robust to varying paper brightness and shadows.
+      B. Color exclusion: skip pixels where B − R > 40 (blue/cyan/purple UI
+         overlays) and where R − B > 50 (red/pink grid lines).
+      C. Darkness gate: pixel is signal if brightness < col_bg − 60 AND passes
+         color checks.  Threshold of 60 catches dark-grey waveforms reliably
+         while rejecting pinkish grid artifacts.
+    """
+    R = region_arr[:, :, 0].astype(np.float32)
+    G = region_arr[:, :, 1].astype(np.float32)
+    B = region_arr[:, :, 2].astype(np.float32)
+    brightness = (R + G + B) / 3.0
+    rH, rW = brightness.shape
+
+    # ── A. Per-column adaptive background ───────────────────────────
+    col_bg = np.percentile(brightness, 88, axis=0)   # shape (rW,)
+
+    # ── B. Color exclusion ───────────────────────────────────────────
+    blue_overlay = (B - R) > 40   # cyan/purple ROI box borders
+    red_grid     = (R - B) > 50   # pink/red ECG grid lines
+
+    # ── C. Signal mask ───────────────────────────────────────────────
+    sig_mask = (
+        (brightness < (col_bg[np.newaxis, :] - 60)) &
+        (~blue_overlay) &
+        (~red_grid)
+    )
+
+    # Skip left edge: calibration pulse + lead-name label
+    skip_px = int(rW * skip_left_frac)
+    sig_mask[:, :skip_px] = False
+
+    # ── Column-by-column median centroid ─────────────────────────────
+    sig_out = np.full(rW, np.nan, dtype=np.float32)
+    for xc in range(skip_px, rW):
+        rows = np.where(sig_mask[:, xc])[0]
+        if len(rows) > 0:
+            sig_out[xc] = 1.0 - (np.median(rows) / rH)
+
+    valid_frac = np.sum(~np.isnan(sig_out)) / rW
+    if valid_frac < 0.05:
+        return np.zeros(seq_len, dtype=np.float32)
+
+    # ── Interpolate NaN gaps (occluded columns) ──────────────────────
+    nans = np.isnan(sig_out)
+    if nans.any():
+        xp = np.where(~nans)[0]
+        if len(xp) > 1:
+            sig_out = np.interp(
+                np.arange(rW), xp, sig_out[~nans]
+            ).astype(np.float32)
+        else:
+            return np.zeros(seq_len, dtype=np.float32)
+
+    # ── Post-processing: smooth → resample → bandpass → z-score ──────
+    sig = median_filter(sig_out, size=5).astype(np.float32)
+    sig = resample(sig, seq_len).astype(np.float32)
+    sig = bandpass(sig, fs=FS)
+    mu, std = sig.mean(), sig.std()
+    return (sig - mu) / std if std > 1e-8 else np.zeros(seq_len, dtype=np.float32)
+
+
 def digitize_uploaded_ecg(pil_image: Image.Image,
                             n_leads: int = 7,
                             seq_len: int = SEQ_LEN) -> np.ndarray:
     """
     Digitize a standard clinical 12-lead ECG printout image.
 
-    Layout (calibrated from pixel analysis of real ECG scans):
-        Left column  (col 0): I, II, III, aVR, aVL, aVF   (rows 0-5)
-        Right column (col 1): V1, V2, V3, V4, V5, V6      (rows 0-5)
+    Layout (calibrated for standard 6-row × 2-column printout):
+        Left column : I, II, III, aVR, aVL, aVF  (rows 0-5)
+        Right column: V1–V6                        (rows 0-5)
 
-    Image is normalised to 2000x1413 internally for consistent thresholds.
-    Signal pixels isolated as black (R,G,B < 80), separating from red grid
-    and white background. Column-by-column median centroid scan extracts
-    1D signal from each lead region.
+    Image is normalised to 2000×1413 internally for stable layout constants.
+    Signal extraction uses _extract_signal_from_region (adaptive, color-aware).
 
     Returns float32 array [n_leads, seq_len].
     """
     pil_image = pil_image.convert('RGB')
-    # Normalise to reference resolution for consistent pixel thresholds
     W, H = 2000, 1413
     pil_image = pil_image.resize((W, H), Image.LANCZOS)
     arr = np.array(pil_image)
 
-    R = arr[:,:,0].astype(np.float32)
-    G = arr[:,:,1].astype(np.float32)
-    B = arr[:,:,2].astype(np.float32)
+    header_end   = 285
+    footer_start = 1373
+    body_H       = footer_start - header_end
+    row_h        = body_H / 6
+    v_inset      = int(row_h * 0.10)
 
-    # Black = signal  |  Red = grid  |  White = background
-    sig_mask = (R < 80) & (G < 80) & (B < 80)
-
-    # Layout constants (calibrated via pixel analysis of real ECG scans)
-    # Header contains patient info + measurements (~20% of height)
-    # Footer contains technical info bar (~3% of height)
-    header_end   = 285    # first body row
-    footer_start = 1373   # last body row
-    body_H       = footer_start - header_end   # 1088 px
-    row_h        = body_H / 6                  # 181 px per lead row
-    v_inset      = int(row_h * 0.10)           # vertical margin per strip
-
-    # Vertical dotted divider between left and right columns at col 1010
     div_col  = 1010
-    cal_skip = 130   # skip calibration square + lead label text
-    r_margin = 20    # skip right edge of each column
+    cal_skip = 130
+    r_margin = 20
 
     col_bounds = [
-        (cal_skip,           div_col - r_margin),   # left col: I,II,III,aVR,aVL,aVF
-        (div_col + cal_skip, W       - r_margin),   # right col: V1,V2,V3,V4,V5,V6
+        (cal_skip,           div_col - r_margin),
+        (div_col + cal_skip, W       - r_margin),
     ]
 
-    # Explicit grid position (row, col) for each of the 7 input leads
     lead_grid = [
         (0, 0),  # I
         (1, 0),  # II
@@ -204,7 +267,6 @@ def digitize_uploaded_ecg(pil_image: Image.Image,
     signals = []
     for lead_idx in range(min(n_leads, len(lead_grid))):
         grow, gcol = lead_grid[lead_idx]
-
         r0 = header_end + int(grow       * row_h) + v_inset
         r1 = header_end + int((grow + 1) * row_h) - v_inset
         c0, c1 = col_bounds[gcol]
@@ -213,40 +275,8 @@ def digitize_uploaded_ecg(pil_image: Image.Image,
             signals.append(np.zeros(seq_len, dtype=np.float32))
             continue
 
-        region = sig_mask[r0:r1, c0:c1]
-        rH, rW = region.shape
-
-        # Column-by-column median centroid scan
-        sig_out = np.full(rW, np.nan, dtype=np.float32)
-        for xc in range(rW):
-            dark = np.where(region[:, xc])[0]
-            if len(dark) > 0:
-                sig_out[xc] = 1.0 - (np.median(dark) / rH)
-
-        # Detect Lead Off: fewer than 5% of columns have signal pixels
-        valid_frac = np.sum(~np.isnan(sig_out)) / rW
-        if valid_frac < 0.05:
-            signals.append(np.zeros(seq_len, dtype=np.float32))
-            continue
-
-        # Interpolate NaN gaps
-        nans = np.isnan(sig_out)
-        if nans.any():
-            xp = np.where(~nans)[0]
-            sig_out = np.interp(np.arange(rW), xp, sig_out[~nans]).astype(np.float32)
-
-        # Light median filter (size=3) to remove isolated noise without blurring QRS
-        sig = median_filter(sig_out, size=3).astype(np.float32)
-
-        # Resample to seq_len, bandpass 0.5-40 Hz, z-score
-        sig = resample(sig, seq_len).astype(np.float32)
-        sig = bandpass(sig, fs=FS)
-        mu  = sig.mean(); std = sig.std()
-        if std > 1e-8:
-            sig = (sig - mu) / std
-        else:
-            sig = np.zeros(seq_len, dtype=np.float32)
-        signals.append(sig)
+        region = arr[r0:r1, c0:c1]
+        signals.append(_extract_signal_from_region(region, seq_len))
 
     return np.stack(signals, axis=0)   # [n_leads, seq_len]
 
@@ -556,6 +586,7 @@ def digitize_from_crops(pil_image: Image.Image,
     """
     Digitize each lead from its manually defined bounding box.
     boxes: dict  lead_name → (x0, y0, x1, y1) in display-image pixels.
+    Uses the shared _extract_signal_from_region pipeline (adaptive, color-aware).
     Returns float32 [7, seq_len].
     """
     arr = np.array(pil_image.convert('RGB'))
@@ -563,47 +594,15 @@ def digitize_from_crops(pil_image: Image.Image,
 
     for lead_name in INPUT_LEADS:
         x0, y0, x1, y1 = boxes[lead_name]
-        # Clamp to image bounds
         x0 = max(0, x0); y0 = max(0, y0)
         x1 = min(arr.shape[1], x1); y1 = min(arr.shape[0], y1)
 
-        if x1 <= x0 or y1 <= y0:
+        if x1 <= x0 + 4 or y1 <= y0 + 4:
             signals.append(np.zeros(seq_len, dtype=np.float32))
             continue
 
         region = arr[y0:y1, x0:x1]
-        R, G, B = region[:,:,0], region[:,:,1], region[:,:,2]
-        sig_mask = (R.astype(np.float32) < 80) & \
-                   (G.astype(np.float32) < 80) & \
-                   (B.astype(np.float32) < 80)
-
-        rH, rW = sig_mask.shape
-        sig_out = np.full(rW, np.nan, dtype=np.float32)
-
-        for xc in range(rW):
-            dark = np.where(sig_mask[:, xc])[0]
-            if len(dark) > 0:
-                sig_out[xc] = 1.0 - (np.median(dark) / rH)
-
-        valid_frac = np.sum(~np.isnan(sig_out)) / rW
-        if valid_frac < 0.05:
-            signals.append(np.zeros(seq_len, dtype=np.float32))
-            continue
-
-        nans = np.isnan(sig_out)
-        if nans.any():
-            xp = np.where(~nans)[0]
-            if len(xp) > 1:
-                sig_out = np.interp(np.arange(rW), xp, sig_out[~nans]).astype(np.float32)
-            else:
-                sig_out = np.full(rW, 0.5, dtype=np.float32)
-
-        sig = median_filter(sig_out, size=3).astype(np.float32)
-        sig = resample(sig, seq_len).astype(np.float32)
-        sig = bandpass(sig, fs=fs)
-        mu  = sig.mean(); std = sig.std()
-        sig = (sig - mu) / std if std > 1e-8 else np.zeros(seq_len, dtype=np.float32)
-        signals.append(sig)
+        signals.append(_extract_signal_from_region(region, seq_len))
 
     return np.stack(signals, axis=0)
 
@@ -1061,8 +1060,6 @@ def main():
                             st.session_state['_roi_lead_idx']   = 0
                             st.session_state['_roi_leads_done'] = set()
                             st.session_state['_signals_7']      = None
-                            for ln in INPUT_LEADS:
-                                st.session_state.pop(f'_raw_{ln}', None)
                             st.rerun()
                     with btn_col2:
                         if st.button(
