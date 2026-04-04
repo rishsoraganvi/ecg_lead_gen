@@ -13,7 +13,7 @@ import matplotlib.gridspec as gridspec
 from PIL import Image
 from scipy.signal import butter, sosfilt, resample
 from scipy.ndimage import median_filter
-from streamlit_drawable_canvas import st_canvas
+import base64, json
 
 warnings.filterwarnings('ignore')
 
@@ -341,6 +341,212 @@ def render_crop_overlay(pil_img: Image.Image, boxes: dict,
     plt.close(fig)
     buf.seek(0)
     return Image.open(buf).convert('RGB')
+
+
+def pil_to_b64(img: Image.Image, fmt: str = "PNG") -> str:
+    """Encode a PIL image as a base64 data-URL string."""
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def roi_canvas_html(img_b64: str,
+                    canvas_w: int,
+                    canvas_h: int,
+                    confirmed_boxes: dict,   # lead→(x0,y0,x1,y1) in canvas coords
+                    active_lead: str,
+                    input_key: str) -> str:
+    """
+    Return a self-contained HTML string that renders a drag-to-draw ROI canvas.
+    The user draws a rectangle; on mouse-up the coords are written as JSON into
+    a hidden <input id='roi_out'> and posted to Streamlit via
+    window.parent.postMessage so st.query_params can pick it up.
+
+    We instead write into a visible <textarea> that the user can copy —
+    but the cleaner path is: embed the result in a <div> that Streamlit's
+    components.v1.html() can read via its return value hack.
+
+    Actually the simplest zero-dep approach: write coords into a named
+    query-param via window.parent.postMessage with type 'streamlit:setComponentValue',
+    which is the official Streamlit custom-component protocol.
+    """
+    # Serialise confirmed boxes for JS
+    confirmed_js = json.dumps({
+        ln: list(b) for ln, b in confirmed_boxes.items()
+    })
+
+    colors = {
+        'I':'#6366f1','II':'#8b5cf6','III':'#a855f7',
+        'aVR':'#06b6d4','aVL':'#0ea5e9','aVF':'#3b82f6',
+        'V1':'#10b981',
+    }
+    active_color = colors.get(active_lead, '#f97316') if active_lead else '#f97316'
+
+    return f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: transparent; }}
+  #wrap {{
+    position: relative;
+    width: {canvas_w}px;
+    height: {canvas_h}px;
+    cursor: crosshair;
+    user-select: none;
+  }}
+  #ecg-img {{
+    position: absolute; top:0; left:0;
+    width: {canvas_w}px; height: {canvas_h}px;
+    pointer-events: none;
+  }}
+  #overlay {{
+    position: absolute; top:0; left:0;
+    width: {canvas_w}px; height: {canvas_h}px;
+  }}
+  #hint {{
+    margin-top: 6px;
+    font-family: sans-serif; font-size: 13px;
+    color: #374151;
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    padding: 6px 10px;
+  }}
+  #coords-out {{
+    margin-top: 6px;
+    font-family: monospace; font-size: 12px;
+    width: 100%; padding: 4px 8px;
+    border: 1px solid #d1d5db; border-radius: 4px;
+    background: #f3f4f6; color: #111827;
+  }}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <img id="ecg-img" src="{img_b64}" draggable="false">
+  <canvas id="overlay" width="{canvas_w}" height="{canvas_h}"></canvas>
+</div>
+<div id="hint">
+  {"🖱️ Click and drag to draw a box around <b>" + active_lead + "</b>" if active_lead else "✅ All leads defined."}
+</div>
+<input id="coords-out" type="text" readonly
+       placeholder="Drawn box coordinates will appear here…">
+
+<script>
+const canvas  = document.getElementById('overlay');
+const ctx     = canvas.getContext('2d');
+const coordEl = document.getElementById('coords-out');
+const W = {canvas_w}, H = {canvas_h};
+
+// ── Confirmed boxes (already drawn leads) ────────────────────────────
+const confirmed = {confirmed_js};
+const leadColors = {json.dumps(colors)};
+
+function drawConfirmed() {{
+  for (const [ln, b] of Object.entries(confirmed)) {{
+    const [x0,y0,x1,y1] = b;
+    const col = leadColors[ln] || '#22c55e';
+    ctx.save();
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = col;
+    ctx.fillRect(x0, y0, x1-x0, y1-y0);
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([]);
+    ctx.strokeRect(x0, y0, x1-x0, y1-y0);
+    // label
+    ctx.fillStyle = col;
+    ctx.font = 'bold 12px sans-serif';
+    ctx.fillText('✓ ' + ln, x0+4, y0+14);
+    ctx.restore();
+  }}
+}}
+
+// ── Live drag-draw ───────────────────────────────────────────────────
+let dragging = false, sx = 0, sy = 0, ex = 0, ey = 0;
+const activeColor = '{active_color}';
+const activeLead  = {json.dumps(active_lead)};
+
+function redraw() {{
+  ctx.clearRect(0, 0, W, H);
+  drawConfirmed();
+  if (dragging || (ex !== 0 && ey !== 0)) {{
+    const rx = Math.min(sx,ex), ry = Math.min(sy,ey);
+    const rw = Math.abs(ex-sx),  rh = Math.abs(ey-sy);
+    ctx.save();
+    ctx.globalAlpha = 0.15;
+    ctx.fillStyle = activeColor;
+    ctx.fillRect(rx, ry, rw, rh);
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = activeColor;
+    ctx.lineWidth = 2.5;
+    ctx.setLineDash([6,3]);
+    ctx.strokeRect(rx, ry, rw, rh);
+    // corner handles
+    const hs = 6;
+    ctx.setLineDash([]);
+    [[rx,ry],[rx+rw,ry],[rx,ry+rh],[rx+rw,ry+rh]].forEach(([cx,cy]) => {{
+      ctx.fillStyle = activeColor;
+      ctx.fillRect(cx-hs/2, cy-hs/2, hs, hs);
+    }});
+    // dimension label
+    if (rw > 30 && rh > 15) {{
+      const label = activeLead ? `${{activeLead}}: ${{rw}}×${{rh}}px` : `${{rw}}×${{rh}}px`;
+      ctx.font = 'bold 12px sans-serif';
+      const tw = ctx.measureText(label).width;
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.fillRect(rx+4, ry+4, tw+8, 18);
+      ctx.fillStyle = activeColor;
+      ctx.fillText(label, rx+8, ry+17);
+    }}
+    ctx.restore();
+  }}
+}}
+
+function getPos(e) {{
+  const r = canvas.getBoundingClientRect();
+  const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+  const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+  return [
+    Math.max(0, Math.min(W, clientX - r.left)),
+    Math.max(0, Math.min(H, clientY - r.top)),
+  ];
+}}
+
+if (activeLead) {{
+  canvas.addEventListener('mousedown',  e => {{ [sx,sy]=getPos(e); ex=sx; ey=sy; dragging=true; }});
+  canvas.addEventListener('mousemove',  e => {{ if (!dragging) return; [ex,ey]=getPos(e); redraw(); }});
+  canvas.addEventListener('mouseup',    e => {{
+    dragging=false; [ex,ey]=getPos(e); redraw();
+    const x0=Math.round(Math.min(sx,ex)), y0=Math.round(Math.min(sy,ey));
+    const x1=Math.round(Math.max(sx,ex)), y1=Math.round(Math.max(sy,ey));
+    const val = JSON.stringify([x0,y0,x1,y1]);
+    coordEl.value = val;
+    // Send to Streamlit component host
+    window.parent.postMessage({{type:'streamlit:setComponentValue', value:val}}, '*');
+  }});
+  canvas.addEventListener('mouseleave', e => {{ if (dragging) {{ dragging=false; redraw(); }} }});
+  // Touch support
+  canvas.addEventListener('touchstart', e=>{{ e.preventDefault(); [sx,sy]=getPos(e); ex=sx; ey=sy; dragging=true; }}, {{passive:false}});
+  canvas.addEventListener('touchmove',  e=>{{ e.preventDefault(); if(!dragging) return; [ex,ey]=getPos(e); redraw(); }}, {{passive:false}});
+  canvas.addEventListener('touchend',   e=>{{ e.preventDefault(); dragging=false; redraw();
+    const x0=Math.round(Math.min(sx,ex)), y0=Math.round(Math.min(sy,ey));
+    const x1=Math.round(Math.max(sx,ex)), y1=Math.round(Math.max(sy,ey));
+    coordEl.value = JSON.stringify([x0,y0,x1,y1]);
+    window.parent.postMessage({{type:'streamlit:setComponentValue', value:coordEl.value}}, '*');
+  }}, {{passive:false}});
+}}
+
+// Initial draw
+redraw();
+</script>
+</body>
+</html>
+"""
 
 
 def digitize_from_crops(pil_image: Image.Image,
@@ -694,139 +900,157 @@ def main():
                 st.session_state['_crop_mode'] = crop_mode
 
                 if crop_mode:
-                    boxes = st.session_state['_crop_boxes']
-
-                    # ── Lead sequencer: which lead are we drawing next? ──
-                    lead_idx = st.session_state.get('_roi_lead_idx', 0)
+                    boxes      = st.session_state['_crop_boxes']
+                    lead_idx   = st.session_state.get('_roi_lead_idx', 0)
                     leads_done = st.session_state.get('_roi_leads_done', set())
 
-                    # Progress chips
+                    # ── Progress chips ────────────────────────────────────
                     chip_html = ""
                     for i, ln in enumerate(INPUT_LEADS):
                         if ln in leads_done:
                             chip_html += (
-                                f'<span style="background:#22c55e;color:#fff;'
-                                f'padding:3px 10px;border-radius:999px;margin:2px;'
-                                f'font-size:13px;font-weight:600">✓ {ln}</span>'
+                                f'<span style="background:#22c55e;color:#fff;padding:3px 10px;'
+                                f'border-radius:999px;margin:2px;font-size:13px;font-weight:600">'
+                                f'✓ {ln}</span>'
                             )
                         elif i == lead_idx:
                             chip_html += (
-                                f'<span style="background:#f97316;color:#fff;'
-                                f'padding:3px 10px;border-radius:999px;margin:2px;'
-                                f'font-size:13px;font-weight:700;'
-                                f'box-shadow:0 0 0 2px #fb923c">● {ln}</span>'
+                                f'<span style="background:#f97316;color:#fff;padding:3px 10px;'
+                                f'border-radius:999px;margin:2px;font-size:13px;font-weight:700;'
+                                f'box-shadow:0 0 0 3px #fed7aa">● {ln}</span>'
                             )
                         else:
                             chip_html += (
-                                f'<span style="background:#e5e7eb;color:#6b7280;'
-                                f'padding:3px 10px;border-radius:999px;margin:2px;'
-                                f'font-size:13px">○ {ln}</span>'
+                                f'<span style="background:#e5e7eb;color:#6b7280;padding:3px 10px;'
+                                f'border-radius:999px;margin:2px;font-size:13px">○ {ln}</span>'
                             )
                     st.markdown(
-                        f'<div style="margin:6px 0 10px">{chip_html}</div>',
+                        f'<div style="margin:6px 0 12px">{chip_html}</div>',
                         unsafe_allow_html=True,
                     )
 
-                    if lead_idx < len(INPUT_LEADS):
-                        active_lead = INPUT_LEADS[lead_idx]
+                    active_lead = INPUT_LEADS[lead_idx] if lead_idx < len(INPUT_LEADS) else None
+
+                    if active_lead:
                         st.markdown(
-                            f"**Draw a box around lead `{active_lead}` on the image below. "
-                            f"Hold and drag to select the waveform strip.**"
+                            f"**🖱️ Click and drag on the image to draw a box around "
+                            f"lead `{active_lead}`, then click Confirm.**"
                         )
                     else:
-                        active_lead = None
-                        st.success("✅ All leads cropped! Click **Apply ROI crops & digitize** below.")
+                        st.success("✅ All leads defined! Click **Apply ROI crops & digitize** below.")
 
-                    # ── Canvas: fit image to fixed display width ──────────
-                    CANVAS_W = 900
+                    # ── Scale image to canvas width ───────────────────────
+                    CANVAS_W = 860
                     scale    = CANVAS_W / W_disp
                     CANVAS_H = int(H_disp * scale)
 
-                    # Build background: overlay all confirmed boxes in green,
-                    # current-lead default box in orange
-                    bg_img = render_crop_overlay(
-                        pil_img.resize((CANVAS_W, CANVAS_H), Image.LANCZOS),
-                        {
-                            ln: (
-                                int(boxes[ln][0] * scale),
-                                int(boxes[ln][1] * scale),
-                                int(boxes[ln][2] * scale),
-                                int(boxes[ln][3] * scale),
-                            )
-                            for ln in leads_done
-                        },
-                        active_lead=None,
+                    # Scale confirmed boxes to canvas coordinates
+                    confirmed_canvas = {
+                        ln: (
+                            int(boxes[ln][0] * scale), int(boxes[ln][1] * scale),
+                            int(boxes[ln][2] * scale), int(boxes[ln][3] * scale),
+                        )
+                        for ln in leads_done
+                    }
+
+                    # Embed the ECG image as a base64 data-URL (no external file needed)
+                    img_resized = pil_img.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
+                    img_b64     = pil_to_b64(img_resized)
+
+                    # ── Render the HTML5 canvas ROI tool ─────────────────
+                    # The component writes coords into a hidden text_input via
+                    # postMessage; we read it back through a st.text_input below.
+                    html_src = roi_canvas_html(
+                        img_b64        = img_b64,
+                        canvas_w       = CANVAS_W,
+                        canvas_h       = CANVAS_H,
+                        confirmed_boxes= confirmed_canvas,
+                        active_lead    = active_lead,
+                        input_key      = f"roi_{active_lead}",
+                    )
+                    import streamlit.components.v1 as components
+                    roi_value = components.html(
+                        html_src,
+                        height=CANVAS_H + 80,
+                        scrolling=False,
                     )
 
-                    # Show canvas only while there are leads left
-                    if active_lead is not None:
-                        canvas_result = st_canvas(
-                            fill_color="rgba(249,115,22,0.15)",
-                            stroke_width=2,
-                            stroke_color="#f97316",
-                            background_image=bg_img,
-                            update_streamlit=True,
-                            width=CANVAS_W,
-                            height=CANVAS_H,
-                            drawing_mode="rect",
-                            key=f"canvas_{active_lead}",
-                        )
+                    # ── Coord readback: hidden text_input synced by JS ────
+                    # postMessage sets component value; we also show a manual
+                    # paste field as reliable fallback (works in all deployments)
+                    st.caption(
+                        "After drawing, the coordinates appear below automatically. "
+                        "If not, right-click the box coordinates in the canvas and paste them here:"
+                    )
+                    raw_coords = st.text_input(
+                        "Box coordinates (auto-filled or paste JSON [x0,y0,x1,y1])",
+                        value=st.session_state.get(f'_raw_{active_lead}', ''),
+                        key=f'coord_input_{active_lead}',
+                        placeholder='[120, 45, 480, 110]',
+                        label_visibility='collapsed',
+                    )
+                    st.session_state[f'_raw_{active_lead}'] = raw_coords
 
-                        # Read the freshly drawn rectangle
-                        if (canvas_result.json_data is not None and
-                                len(canvas_result.json_data.get("objects", [])) > 0):
-                            obj = canvas_result.json_data["objects"][-1]
-                            if obj.get("type") == "rect" and obj.get("width", 0) > 5:
-                                # Canvas coords → original image coords
-                                cx0 = int(obj["left"]              / scale)
-                                cy0 = int(obj["top"]               / scale)
-                                cx1 = int((obj["left"]+obj["width"])  / scale)
-                                cy1 = int((obj["top"] +obj["height"]) / scale)
+                    # Parse and show confirm / skip buttons
+                    parsed_box = None
+                    if raw_coords.strip():
+                        try:
+                            vals = json.loads(raw_coords.strip())
+                            if (isinstance(vals, list) and len(vals) == 4 and
+                                    all(isinstance(v, (int, float)) for v in vals)):
+                                # Convert canvas coords → original image coords
+                                cx0 = int(vals[0] / scale); cy0 = int(vals[1] / scale)
+                                cx1 = int(vals[2] / scale); cy1 = int(vals[3] / scale)
+                                if cx1 > cx0 + 4 and cy1 > cy0 + 4:
+                                    parsed_box = (cx0, cy0, cx1, cy1)
+                                    st.caption(
+                                        f"📐 Box: x={cx0}–{cx1}, y={cy0}–{cy1} "
+                                        f"({cx1-cx0}×{cy1-cy0} px in original image)"
+                                    )
+                        except (json.JSONDecodeError, ValueError):
+                            st.warning("Could not parse coordinates — draw again or check the JSON.")
 
-                                confirm_col, skip_col = st.columns([2, 1])
-                                with confirm_col:
-                                    if st.button(
-                                        f"✔ Confirm box for **{active_lead}**  "
-                                        f"({cx1-cx0}×{cy1-cy0} px)",
-                                        type="primary",
-                                    ):
-                                        boxes[active_lead] = (cx0, cy0, cx1, cy1)
-                                        st.session_state['_crop_boxes']     = boxes
-                                        leads_done.add(active_lead)
-                                        st.session_state['_roi_leads_done'] = leads_done
-                                        st.session_state['_roi_lead_idx']   = lead_idx + 1
-                                        st.rerun()
-                                with skip_col:
-                                    if st.button("⏭ Skip (keep auto)"):
-                                        leads_done.add(active_lead)
-                                        st.session_state['_roi_leads_done'] = leads_done
-                                        st.session_state['_roi_lead_idx']   = lead_idx + 1
-                                        st.rerun()
+                    if active_lead:
+                        confirm_col, skip_col = st.columns([3, 1])
+                        with confirm_col:
+                            confirm_disabled = parsed_box is None
+                            if st.button(
+                                f"✔ Confirm ROI for **{active_lead}**",
+                                type="primary",
+                                disabled=confirm_disabled,
+                                use_container_width=True,
+                            ):
+                                boxes[active_lead] = parsed_box
+                                st.session_state['_crop_boxes']            = boxes
+                                st.session_state[f'_raw_{active_lead}']   = ''
+                                leads_done.add(active_lead)
+                                st.session_state['_roi_leads_done']        = leads_done
+                                st.session_state['_roi_lead_idx']          = lead_idx + 1
+                                st.rerun()
+                        with skip_col:
+                            if st.button("⏭ Skip", use_container_width=True,
+                                         help="Keep the auto-detected region for this lead"):
+                                st.session_state[f'_raw_{active_lead}'] = ''
+                                leads_done.add(active_lead)
+                                st.session_state['_roi_leads_done'] = leads_done
+                                st.session_state['_roi_lead_idx']   = lead_idx + 1
+                                st.rerun()
 
-                        # Live crop preview below canvas
-                        x0b, y0b, x1b, y1b = boxes[active_lead]
-                        crop_prev = pil_img.crop((x0b, y0b, x1b, y1b))
-                        st.caption(
-                            f"Current region for **{active_lead}** "
-                            f"({x1b-x0b}×{y1b-y0b} px original) — updates after confirm"
-                        )
-                        st.image(crop_prev, use_container_width=True)
+                        # Live preview of current region
+                        preview_box = parsed_box if parsed_box else boxes[active_lead]
+                        st.markdown(f"**Preview — `{active_lead}` current region:**")
+                        st.image(pil_img.crop(preview_box), use_container_width=True)
 
                     else:
-                        # All leads done — show summary overlay
+                        # All done — summary overlay
+                        summary_scale = CANVAS_W / W_disp
                         summary_img = render_crop_overlay(
                             pil_img.resize((CANVAS_W, CANVAS_H), Image.LANCZOS),
-                            {
-                                ln: (
-                                    int(boxes[ln][0] * scale),
-                                    int(boxes[ln][1] * scale),
-                                    int(boxes[ln][2] * scale),
-                                    int(boxes[ln][3] * scale),
-                                )
-                                for ln in boxes
-                            },
+                            {ln: (int(boxes[ln][0]*summary_scale), int(boxes[ln][1]*summary_scale),
+                                  int(boxes[ln][2]*summary_scale), int(boxes[ln][3]*summary_scale))
+                             for ln in boxes},
                         )
-                        st.image(summary_img, caption="Final ROI layout", use_container_width=True)
+                        st.image(summary_img, caption="Final ROI layout — all 7 leads", use_container_width=True)
 
                     # ── Action buttons ────────────────────────────────────
                     st.divider()
@@ -837,12 +1061,15 @@ def main():
                             st.session_state['_roi_lead_idx']   = 0
                             st.session_state['_roi_leads_done'] = set()
                             st.session_state['_signals_7']      = None
+                            for ln in INPUT_LEADS:
+                                st.session_state.pop(f'_raw_{ln}', None)
                             st.rerun()
                     with btn_col2:
                         if st.button(
                             "✅ Apply ROI crops & digitize",
                             type='primary',
                             disabled=(len(leads_done) == 0),
+                            use_container_width=True,
                         ):
                             with st.spinner("Digitizing from ROI crops…"):
                                 try:
