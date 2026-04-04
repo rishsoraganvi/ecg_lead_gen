@@ -250,6 +250,157 @@ def digitize_uploaded_ecg(pil_image: Image.Image,
     return np.stack(signals, axis=0)   # [n_leads, seq_len]
 
 
+# ── Manual-crop helpers ───────────────────────────────────────────────────────
+
+def default_lead_crops(img_w: int, img_h: int) -> dict:
+    """
+    Return default bounding boxes for the 7 input leads in image pixel coords.
+    Boxes are derived from the same layout constants used in digitize_uploaded_ecg,
+    but expressed relative to the *display* image size (img_w × img_h).
+
+    Returns dict: lead_name → (x0, y0, x1, y1)  in display-image pixels.
+    """
+    # Reference resolution used internally
+    REF_W, REF_H = 2000, 1413
+    sx = img_w / REF_W
+    sy = img_h / REF_H
+
+    header_end   = 285
+    footer_start = 1373
+    body_H       = footer_start - header_end
+    row_h        = body_H / 6
+    v_inset      = int(row_h * 0.10)
+    div_col      = 1010
+    cal_skip     = 130
+    r_margin     = 20
+
+    col_bounds_ref = [
+        (cal_skip,           div_col - r_margin),
+        (div_col + cal_skip, REF_W   - r_margin),
+    ]
+
+    lead_grid = [
+        (0, 0),  # I
+        (1, 0),  # II
+        (2, 0),  # III
+        (3, 0),  # aVR
+        (4, 0),  # aVL
+        (5, 0),  # aVF
+        (0, 1),  # V1
+    ]
+
+    boxes = {}
+    for lead_name, (grow, gcol) in zip(INPUT_LEADS, lead_grid):
+        r0 = header_end + int(grow       * row_h) + v_inset
+        r1 = header_end + int((grow + 1) * row_h) - v_inset
+        c0, c1 = col_bounds_ref[gcol]
+        # Scale to display resolution
+        boxes[lead_name] = (
+            int(c0 * sx), int(r0 * sy),
+            int(c1 * sx), int(r1 * sy),
+        )
+    return boxes
+
+
+def render_crop_overlay(pil_img: Image.Image, boxes: dict,
+                         active_lead: str = None) -> Image.Image:
+    """
+    Draw crop-box overlays on pil_img.
+    active_lead box is drawn in bright orange; others in cyan.
+    Returns a new PIL Image.
+    """
+    COLORS = {
+        'I':   '#00BFFF', 'II':  '#00BFFF', 'III': '#00BFFF',
+        'aVR': '#00BFFF', 'aVL': '#00BFFF', 'aVF': '#00BFFF',
+        'V1':  '#00BFFF',
+    }
+    W, H = pil_img.size
+    dpi  = 96
+    fig, ax = plt.subplots(figsize=(W / dpi, H / dpi), dpi=dpi)
+    ax.imshow(np.array(pil_img))
+    ax.axis('off')
+    fig.subplots_adjust(0, 0, 1, 1)
+
+    for name, (x0, y0, x1, y1) in boxes.items():
+        color = '#FF8C00' if name == active_lead else COLORS.get(name, '#00BFFF')
+        lw    = 2.5 if name == active_lead else 1.5
+        rect  = plt.Rectangle((x0, y0), x1 - x0, y1 - y0,
+                               linewidth=lw, edgecolor=color,
+                               facecolor=color, alpha=0.08)
+        ax.add_patch(rect)
+        border = plt.Rectangle((x0, y0), x1 - x0, y1 - y0,
+                                linewidth=lw, edgecolor=color, facecolor='none')
+        ax.add_patch(border)
+        ax.text(x0 + 4, y0 + 14, name,
+                color=color, fontsize=8, fontweight='bold',
+                bbox=dict(facecolor='white', alpha=0.55, pad=1, linewidth=0))
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
+    plt.close(fig)
+    buf.seek(0)
+    return Image.open(buf).convert('RGB')
+
+
+def digitize_from_crops(pil_image: Image.Image,
+                          boxes: dict,
+                          seq_len: int = SEQ_LEN,
+                          fs: int = FS) -> np.ndarray:
+    """
+    Digitize each lead from its manually defined bounding box.
+    boxes: dict  lead_name → (x0, y0, x1, y1) in display-image pixels.
+    Returns float32 [7, seq_len].
+    """
+    arr = np.array(pil_image.convert('RGB'))
+    signals = []
+
+    for lead_name in INPUT_LEADS:
+        x0, y0, x1, y1 = boxes[lead_name]
+        # Clamp to image bounds
+        x0 = max(0, x0); y0 = max(0, y0)
+        x1 = min(arr.shape[1], x1); y1 = min(arr.shape[0], y1)
+
+        if x1 <= x0 or y1 <= y0:
+            signals.append(np.zeros(seq_len, dtype=np.float32))
+            continue
+
+        region = arr[y0:y1, x0:x1]
+        R, G, B = region[:,:,0], region[:,:,1], region[:,:,2]
+        sig_mask = (R.astype(np.float32) < 80) & \
+                   (G.astype(np.float32) < 80) & \
+                   (B.astype(np.float32) < 80)
+
+        rH, rW = sig_mask.shape
+        sig_out = np.full(rW, np.nan, dtype=np.float32)
+
+        for xc in range(rW):
+            dark = np.where(sig_mask[:, xc])[0]
+            if len(dark) > 0:
+                sig_out[xc] = 1.0 - (np.median(dark) / rH)
+
+        valid_frac = np.sum(~np.isnan(sig_out)) / rW
+        if valid_frac < 0.05:
+            signals.append(np.zeros(seq_len, dtype=np.float32))
+            continue
+
+        nans = np.isnan(sig_out)
+        if nans.any():
+            xp = np.where(~nans)[0]
+            if len(xp) > 1:
+                sig_out = np.interp(np.arange(rW), xp, sig_out[~nans]).astype(np.float32)
+            else:
+                sig_out = np.full(rW, 0.5, dtype=np.float32)
+
+        sig = median_filter(sig_out, size=3).astype(np.float32)
+        sig = resample(sig, seq_len).astype(np.float32)
+        sig = bandpass(sig, fs=fs)
+        mu  = sig.mean(); std = sig.std()
+        sig = (sig - mu) / std if std > 1e-8 else np.zeros(seq_len, dtype=np.float32)
+        signals.append(sig)
+
+    return np.stack(signals, axis=0)
+
+
 # ── Model classes
 
 
@@ -519,16 +670,116 @@ def main():
                 type=['png', 'jpg', 'jpeg']
             )
             if uploaded_img:
-                pil_img = Image.open(uploaded_img).convert('RGB')
-                st.image(pil_img, caption="Uploaded ECG", use_container_width=True)
+                # Cache image in session state so sliders don't re-upload
+                img_key = uploaded_img.name + str(uploaded_img.size)
+                if st.session_state.get('_img_key') != img_key:
+                    pil_img = Image.open(uploaded_img).convert('RGB')
+                    st.session_state['_pil_img']  = pil_img
+                    st.session_state['_img_key']  = img_key
+                    # Initialise default crop boxes
+                    W_disp, H_disp = pil_img.size
+                    st.session_state['_crop_boxes'] = default_lead_crops(W_disp, H_disp)
+                    st.session_state['_signals_7']  = None
 
-                with st.spinner("Digitizing ECG image…"):
-                    try:
-                        signals_7 = digitize_uploaded_ecg(pil_img, n_leads=7, seq_len=SEQ_LEN)
-                        st.success(f"✓ Digitized: shape {signals_7.shape},"
-                                   f" range [{signals_7.min():.2f}, {signals_7.max():.2f}]")
-                    except Exception as e:
-                        st.error(f"Digitization failed: {e}")
+                pil_img    = st.session_state['_pil_img']
+                W_disp, H_disp = pil_img.size
+
+                # ── Crop mode toggle ──────────────────────────────────────
+                crop_mode = st.toggle(
+                    "✂️ Manual lead crop mode",
+                    value=st.session_state.get('_crop_mode', False),
+                    help="Adjust per-lead bounding boxes to improve digitization accuracy",
+                )
+                st.session_state['_crop_mode'] = crop_mode
+
+                if crop_mode:
+                    st.info(
+                        "Select a lead below, then drag the sliders to fit the bounding box "
+                        "tightly around the waveform strip. Click **Apply crops** when done."
+                    )
+
+                    boxes = st.session_state['_crop_boxes']
+
+                    # Lead selector
+                    active_lead = st.selectbox(
+                        "Lead to adjust", INPUT_LEADS,
+                        key='_active_lead'
+                    )
+
+                    # Overlay preview (updates live as sliders move)
+                    overlay_img = render_crop_overlay(pil_img, boxes, active_lead)
+                    st.image(overlay_img,
+                             caption="Crop boxes — active lead highlighted in orange",
+                             use_container_width=True)
+
+                    # Per-lead slider controls
+                    x0, y0, x1, y1 = boxes[active_lead]
+                    st.markdown(f"**Adjust crop box for lead `{active_lead}`:**")
+
+                    c_left, c_right = st.columns(2)
+                    with c_left:
+                        new_x0 = st.slider("Left  (x0)",  0, W_disp - 2, int(x0), key='sl_x0')
+                        new_y0 = st.slider("Top   (y0)",  0, H_disp - 2, int(y0), key='sl_y0')
+                    with c_right:
+                        new_x1 = st.slider("Right (x1)",  new_x0 + 1, W_disp, int(x1), key='sl_x1')
+                        new_y1 = st.slider("Bottom(y1)",  new_y0 + 1, H_disp, int(y1), key='sl_y1')
+
+                    # Update box immediately for live preview on next rerun
+                    boxes[active_lead] = (new_x0, new_y0, new_x1, new_y1)
+                    st.session_state['_crop_boxes'] = boxes
+
+                    # Preview the cropped region for active lead
+                    crop_preview = pil_img.crop((new_x0, new_y0, new_x1, new_y1))
+                    st.markdown(f"**Cropped region — `{active_lead}`:**")
+                    st.image(crop_preview, use_container_width=True)
+
+                    # Reset + Apply buttons
+                    btn_col1, btn_col2 = st.columns(2)
+                    with btn_col1:
+                        if st.button("↩ Reset all crops to auto-detected"):
+                            st.session_state['_crop_boxes'] = default_lead_crops(W_disp, H_disp)
+                            st.session_state['_signals_7']  = None
+                            st.rerun()
+                    with btn_col2:
+                        if st.button("✅ Apply crops & digitize", type='primary'):
+                            with st.spinner("Digitizing from manual crops…"):
+                                try:
+                                    signals_7 = digitize_from_crops(
+                                        pil_img,
+                                        st.session_state['_crop_boxes'],
+                                        seq_len=SEQ_LEN,
+                                    )
+                                    st.session_state['_signals_7'] = signals_7
+                                    st.success(
+                                        f"✓ Digitized from manual crops: shape {signals_7.shape}, "
+                                        f"range [{signals_7.min():.2f}, {signals_7.max():.2f}]"
+                                    )
+                                except Exception as e:
+                                    st.error(f"Digitization failed: {e}")
+
+                    signals_7 = st.session_state.get('_signals_7')
+
+                else:
+                    # Auto mode — show image and auto-digitize
+                    st.image(pil_img, caption="Uploaded ECG", use_container_width=True)
+
+                    if st.session_state.get('_signals_7') is None:
+                        with st.spinner("Auto-digitizing ECG image…"):
+                            try:
+                                signals_7 = digitize_uploaded_ecg(pil_img, n_leads=7, seq_len=SEQ_LEN)
+                                st.session_state['_signals_7'] = signals_7
+                                st.success(
+                                    f"✓ Auto-digitized: shape {signals_7.shape}, "
+                                    f"range [{signals_7.min():.2f}, {signals_7.max():.2f}]"
+                                )
+                            except Exception as e:
+                                st.error(f"Digitization failed: {e}")
+                    else:
+                        signals_7 = st.session_state['_signals_7']
+                        st.success(
+                            f"✓ Digitized: shape {signals_7.shape}, "
+                            f"range [{signals_7.min():.2f}, {signals_7.max():.2f}]"
+                        )
 
         else:  # Signal file
             uploaded_sig = st.file_uploader(
